@@ -9,9 +9,10 @@ I'm rebuilding my Spring Boot/Java skills after a few years mostly living in Pyt
 event-driven systems elsewhere (MQTT, ZeroMQ, edge/AI orchestration), and this project is
 the vehicle for that — deliberately structured as a series of phases, each one adding a
 layer of "how would this actually behave in production" rather than stopping at "it
-works on my machine." It's the first of two portfolio projects; the second will pick up
-a different kind of hard problem — correctness under concurrency, via event sourcing —
-once this one's done.
+works on my machine." All five planned phases (P1–P5) are done as of this writing — see
+the roadmap below for what each one actually covers. It's the first of two portfolio
+projects; the second will pick up a different kind of hard problem — correctness under
+concurrency, via event sourcing — now that this one's in a solid state.
 
 ## Stack
 
@@ -94,6 +95,27 @@ dropped (with a warning logged) beyond that. It's a small, honest compromise: re
 have flaky connectivity, and treating "10 seconds late" the same as "would never arrive"
 felt wrong.
 
+### Delivery guarantees: acks, dedup, and graceful shutdown
+
+The MQTT path is built to survive a crash without silently losing or duplicating data,
+which took a real bug to get right (see Load testing below for the story).
+
+- **Manual acknowledgment.** The MQTT subscriber doesn't tell the broker "delivered" the
+  moment a message is parsed and queued — it waits until `ReadingWorkerPool` has actually
+  persisted the reading to Postgres before calling `acknowledge()`. If the app crashes
+  between enqueueing and persisting, the broker (QoS 1, `cleanSession(false)`) redelivers
+  the message on reconnect instead of it vanishing into an in-memory queue that no longer
+  exists.
+- **Idempotency-key dedup.** Manual acks mean redelivery is expected, which means the same
+  reading can legitimately arrive twice. Every `ReadingRequest` carries a client-generated
+  `idempotencyKey`, enforced unique at the database level (`ReadingEntity`). A redelivered
+  duplicate hits that unique constraint, gets caught, and returns the already-persisted
+  record instead of double-inserting — and, just as importantly, without double-counting it
+  into the windowed aggregate.
+- **Graceful shutdown.** `ReadingWorkerPool` stops accepting new work and drains whatever's
+  currently queued (up to a bounded timeout) before the JVM exits, instead of abruptly
+  killing worker threads mid-write.
+
 ## Running locally
 
 ```bash
@@ -107,6 +129,7 @@ The app starts on port `8080` by default (override with `server.port` in
 - Swagger UI: `http://localhost:8080/swagger-ui.html`
 - OpenAPI spec: `http://localhost:8080/v3/api-docs`
 - Actuator health: `http://localhost:8080/actuator`
+- Actuator metrics: `http://localhost:8080/actuator/metrics` (see Observability below)
 
 ### Configuration
 
@@ -127,7 +150,21 @@ worker.pool-size=4         # fixed-pool worker count (unused in virtual-thread m
 
 window.duration-minutes=1        # tumbling window size for aggregation
 window.grace-period-seconds=10   # how late a reading can arrive and still be accepted
+
+management.endpoints.web.exposure.include=health,metrics
 ```
+
+## Observability
+
+Beyond the default `health` endpoint, four custom Micrometer metrics are exposed at
+`/actuator/metrics/{name}`:
+
+| Metric                     | Type    | What it tells you                                  |
+|-----------------------------|---------|------------------------------------------------------|
+| `reading.queue.depth`       | Gauge   | Current backlog between MQTT ingestion and DB writes |
+| `reading.late.accepted`     | Counter | Late readings accepted within the grace period       |
+| `reading.late.dropped`      | Counter | Late readings dropped past the grace period          |
+| `reading.duplicate`         | Counter | Redelivered readings caught by idempotency dedup     |
 
 ## API
 
@@ -145,8 +182,19 @@ Readings can also be submitted over MQTT by publishing to `devices/{deviceId}/re
 with a JSON body matching the HTTP request shape:
 
 ```json
-{"metricType": "temperature", "value": 21.5}
+{
+  "metricType": "temperature",
+  "value": 21.5,
+  "recordedAt": "2026-09-25T10:15:30.123Z",
+  "idempotencyKey": "a3f1c2e0-4b9d-4e2a-9c1a-7d6b5e4f3a2b"
+}
 ```
+
+`idempotencyKey` is required — generate it once per logical reading and send the *same*
+value on every retry/republish of that reading, so a redelivered duplicate can be
+recognized as one instead of inserted twice. `recordedAt` is optional (the server
+defaults to receipt time if omitted), but for anything that might be retried, supplying
+it is what makes the dedup and late-window-handling logic actually meaningful.
 
 All responses are wrapped in a consistent envelope (`ApiResponse<T>`):
 
@@ -162,11 +210,22 @@ validation failures, a list of per-field errors — handled centrally in
 
 `scripts/burst_publish.py` bursts N MQTT messages and polls the database to measure
 sustained drain throughput — used for the concurrency benchmarking above and for
-verifying backpressure behavior under load. It's also how a very real bug got found: an
-early run kept stalling partway through a 10,000-message burst, which turned out to be
-Mosquitto silently dropping messages past its default per-client queue limit — not a bug
-in the app at all, but a broker default that didn't match the scale of the test. That's
-now documented as a config setting (`max_queued_messages`) rather than a mystery.
+verifying backpressure behavior under load. It's also how two very real bugs got found:
+
+- An early run kept stalling partway through a 10,000-message burst, which turned out to
+  be Mosquitto silently dropping messages past its default per-client queue limit — not a
+  bug in the app at all, but a broker default that didn't match the scale of the test.
+  That's now documented as a config setting (`max_queued_messages`) rather than a mystery.
+- After adding manual acks and dedup (see above), a burst test produced *more* rows in
+  Postgres than messages published. A broker-forced session takeover mid-test caused a
+  batch of in-flight messages to be redelivered — expected — but the dedup logic didn't
+  catch the duplicates. The original dedup key was `(deviceId, metricType, recordedAt)`,
+  and the test payload never set `recordedAt`, so the server defaulted it to
+  `Instant.now()` fresh on *every* delivery attempt, including redeliveries — meaning the
+  one field the dedup key relied on being stable was actually different every time. Fixed
+  by switching to an explicit, client-generated `idempotencyKey` that stays identical
+  across retries by construction, rather than depending on a timestamp to happen to
+  collide.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -182,30 +241,130 @@ under concurrency via event sourcing and CQRS. Together they're meant to cover b
 of the same underlying skill: keeping up with volume, and never getting a concurrent
 operation wrong.
 
-- [x] **P1 — REST + JPA baseline.** The unglamorous but necessary foundation: device and
-      reading CRUD over HTTP, proper entity/DTO separation, validation at the door,
-      centralized error handling. Nothing here is exciting on its own, but it's the part
-      that has to be right before anything built on top of it can be trusted.
+- [x] **P1 — REST + JPA baseline.** Device and reading CRUD over HTTP — unglamorous, but
+      every decision here is load-bearing for everything built on top of it later.
+      - **Entities never leave the service layer.** `DeviceResponse`/`ReadingResponse` are
+        hand-built, read-only DTOs, not the JPA entities themselves. Returning entities
+        directly would couple the API's shape to the database schema (a column rename
+        becomes a breaking API change), risk leaking Hibernate proxy internals through
+        Jackson, and — concretely, for `ReadingEntity` — risk a `LazyInitializationException`
+        the moment a `@ManyToOne` association got serialized outside an open session.
+      - **`Reading.id` uses a pooled `SEQUENCE`, not `IDENTITY`.** `IDENTITY` forces
+        Hibernate to insert one row at a time, because the database has to assign the key
+        before Hibernate can know it — which silently defeats JDBC batching no matter what
+        else is configured. A pooled sequence (`allocationSize = 50`) lets Hibernate reserve
+        a block of IDs in one round-trip and batch inserts freely. This one regressed at
+        least once during the project (someone — me — pasted the wrong strategy back in)
+        and had to be caught and restored.
+      - **Constructor injection everywhere, no `@Autowired` fields.** Not because field
+        injection doesn't work — it does — but because constructor injection gives you
+        `final` fields, a class whose dependencies are declared where anyone can see them,
+        and something you can `new` up directly in a test without a Spring context.
+      - **Validation lives on the DTO, never the entity.** A bad request should be rejected
+        at the door with a 400 before it's ever turned into an entity, not discovered three
+        layers deeper as a database constraint violation.
 
-- [x] **P2 — MQTT ingestion.** Swapped (well, added alongside) HTTP intake for a real MQTT
-      subscriber via Spring Integration, mirroring the kind of edge/device-stream ingestion
-      I'd previously done in Python. This is also where Spring Boot 4's more aggressive
-      module-splitting bit hardest — see the gotchas section below.
+- [x] **P2 — MQTT ingestion.** Added a real MQTT subscriber (Spring Integration, Eclipse
+      Paho underneath) alongside the existing HTTP intake, mirroring the kind of
+      edge/device-stream ingestion I'd previously built in Python.
+      - **Spring Integration over raw Paho**, even though raw Paho would have meant writing
+        my own reconnect/backpressure handling by hand (arguably more interesting to build).
+        Chose the adapter because P3 and P5 were always going to need production-grade
+        reconnection and manual-ack semantics, and Spring Integration's already solved that
+        — better to spend the interesting-code budget on the queue/worker-pool/dedup logic
+        that's actually specific to this project, not on re-deriving MQTT plumbing that's a
+        solved problem.
+      - **`config` (bean wiring) is a separate package from `mqtt` (message-handling logic)**
+        — the same instinct as keeping DTOs separate from services. A `@Configuration` class
+        should only wire things together; the `@ServiceActivator` that actually parses
+        payloads and makes business decisions is a different kind of concern and lives
+        elsewhere.
+      - **This is also where Spring Boot 4's module-splitting caused a real, silent bug**
+        — adding `spring-integration-mqtt` alone wasn't enough to get `@EnableIntegration`
+        applied, so the `@ServiceActivator` was never wired to its channel and every message
+        vanished with "dispatcher has no subscribers." See the gotchas section below for the
+        full diagnosis.
 
 - [x] **P3 — Concurrency & backpressure.** The heart of this project's story: decoupling
-      MQTT receipt from database writes with a bounded queue and a worker pool, then
-      deliberately overwhelming it to prove the backpressure actually works, then
-      benchmarking a fixed thread pool against virtual threads to see which one's claims
-      hold up under an actual measurement instead of a blog post's assertion.
+      MQTT receipt from database writes with a bounded queue and a worker pool.
+      - **`ArrayBlockingQueue`, not `LinkedBlockingQueue`** — a hard, fixed-capacity bound,
+        chosen deliberately over a queue that's *technically* boundable but more commonly
+        used unbounded by default. The whole point of this phase was proving backpressure
+        actually happens, so the boundedness needed to be unambiguous.
+      - **Block the producer when the queue is full**, rather than dropping the newest
+        message or evicting the oldest. Telemetry data that's merely late is still useful;
+        telemetry data that's silently discarded isn't recoverable. Blocking `put()`
+        propagates the slowdown all the way back to the MQTT client, which is exactly the
+        point — the system should visibly push back, not quietly lose data.
+      - **The queue holds a parsed, validated `ParsedReading`, not the raw MQTT message.**
+        JSON parsing happens on the producer side, before enqueueing, so a malformed payload
+        fails fast instead of occupying a queue slot and a worker cycle only to fail later.
+      - **Virtual threads aren't free concurrency — this one caused a real incident.** An
+        early "one virtual thread per queued item, no cap" version looked fine at a small
+        burst size, then completely stalled at 10,000 messages: thousands of virtual threads
+        all raced for HikariCP's 10-connection pool simultaneously, most timed out waiting
+        30s for a connection, and the pipeline froze in a mass-timeout pileup. The fix was a
+        `Semaphore` capping in-flight concurrency to match the DB pool size — the real lesson
+        being that virtual threads move the bottleneck from thread count to whatever
+        constrained resource they're all contending for; they don't remove the bottleneck.
+      - **The fixed-pool vs. virtual-threads benchmark was run twice, on purpose** — the
+        first comparison (4-worker fixed pool vs. 10-concurrency virtual threads) mixed up
+        two variables at once and produced a number that couldn't be trusted. Re-running
+        both at equal concurrency (10) showed platform threads actually *winning* at that
+        scale — a more honest and more interesting result than "virtual threads win," since
+        it shows their advantage is in supporting much higher concurrency cheaply, not in
+        beating an already-well-sized pool.
 
 - [x] **P4 — Windowed aggregation.** Per-device rolling metrics (avg/p95) over 1-minute
-      windows, with explicit, deliberate handling of out-of-order and late-arriving data
-      rather than pretending every reading shows up exactly when it should.
+      windows.
+      - **Windowed by event time (`recordedAt`), not processing time (`ingestedAt`).** This
+        is the one decision the entire phase hinges on — bucketing by *when the server
+        received it* would make "late data" a meaningless concept, since nothing could ever
+        arrive after its own window if the window is defined by arrival. Event-time
+        windowing is what makes lateness something you can actually detect and reason about.
+      - **A grace period, not a hard cutoff, for late data.** The first version dropped
+        anything arriving after its window closed, or accepted everything unconditionally —
+        neither felt right. Real devices have flaky connectivity; treating "10 seconds late"
+        identically to "would never arrive" was the wrong tradeoff. Landed on: accept within
+        a configurable grace window, drop (with a metric) beyond it.
+      - **`CopyOnWriteArrayList` inside `WindowAccumulator`**, specifically because reads
+        (computing average/p95, which iterate the whole list) never block writers and vice
+        versa — at the cost of every `add()` copying the underlying array, which is a
+        known, accepted limitation at this window size and would need revisiting (a
+        streaming percentile estimator, e.g.) at much higher per-window volume.
+      - **`getCurrentWindow` returns `Optional`, and the controller returns 404 on empty**
+        rather than a zeroed-out response — an empty window isn't a real answer, it's the
+        absence of one, and pretending otherwise would hide the difference between "no data
+        yet" and "the average really is zero."
 
-- [ ] **P5 — Resilience.** Still ahead: at-least-once delivery guarantees, deduplication
-      for the inevitable retries, a graceful shutdown that actually drains the queue
-      instead of dropping whatever's in flight, and richer Actuator metrics so the system
-      can tell you how it's doing instead of you having to guess.
+- [x] **P5 — Resilience.** True end-to-end at-least-once delivery, deduplication, graceful
+      shutdown, and observability — the phase where a genuine, non-obvious distributed-
+      systems bug got found and fixed, not just simulated for the write-up.
+      - **Manual MQTT acknowledgment, not the default auto-ack.** The default acks the
+        broker as soon as a message is *enqueued*, which only guarantees "the broker won't
+        resend it" — not "it's actually durable." Since the internal queue is in-memory, a
+        crash between enqueue and persist would lose the reading while the broker believed
+        it was delivered. Moving the ack to *after* the DB write closes that gap.
+      - **Manual acks create duplicate deliveries by design** (a crash before acking means
+        the broker redelivers on reconnect), which is why dedup had to follow immediately —
+        the two aren't independent features, the first one *requires* the second.
+      - **Dedup had to be durable (DB-backed), not an in-memory cache — and this was a
+        deliberate rejection, not an oversight.** Redelivery only happens *after* a
+        reconnect, i.e. after whatever in-memory state existed before the crash is already
+        gone. A cache would fail to catch exactly the case it exists to catch.
+      - **The dedup key changed mid-phase, because the first version genuinely broke.**
+        Started with `(deviceId, metricType, recordedAt)` — content-based, no API change
+        needed. A load test then produced more DB rows than messages published: a
+        broker-forced session takeover caused a real redelivery, but the test payload never
+        set `recordedAt`, so the server defaulted it fresh on every delivery attempt
+        *including retries* — the one field the key depended on being stable never was.
+        Replaced it with an explicit, client-generated `idempotencyKey`, which stays
+        identical across retries by construction instead of by hoping a timestamp collides.
+      - **Graceful shutdown polls instead of blocking on `take()`.** A worker blocked
+        indefinitely on an empty queue can't check "should I still be running" without being
+        forcibly interrupted — which risks cutting off an in-flight write. Swapping to a
+        1-second `poll()` with a `volatile running` flag lets workers notice a shutdown
+        signal within a bounded window and exit between items, not mid-item.
 
 ## Notable Spring Boot 4 gotchas hit along the way
 

@@ -28,7 +28,10 @@ import org.springframework.web.bind.annotation.RequestParam;
 
 
 
-@RestController 
+// Thin on purpose — every method here just validates input shape (@Valid), delegates to
+// DeviceSvc for the actual logic, and wraps the result in the standard ApiResponse
+// envelope. No business decisions get made in this class.
+@RestController
 @RequestMapping("/devices")
 public class DeviceController {
 

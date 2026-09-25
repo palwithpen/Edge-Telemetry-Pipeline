@@ -12,10 +12,16 @@ import argparse
 import json
 import subprocess
 import time
+import uuid
+from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
 
 
+# Shells out to `docker exec ... psql` rather than pulling in psycopg2 — this script has
+# exactly one job (poll a count), and adding a real DB driver dependency for one query felt
+# like more setup than it's worth. Reuses the same Postgres container the app already talks
+# to, so there's nothing extra to configure.
 def reading_count(container, db_user, db_name, device_id):
     result = subprocess.run(
         [
@@ -56,7 +62,18 @@ def main():
     publish_start = time.monotonic()
 
     for i in range(args.count):
-        payload = json.dumps({"metricType": "temperature", "value": 20.0 + (i % 10)})
+        # Both of these are generated ONCE per message, before publish — not regenerated on
+        # a retry, because MQTT redelivery resends the exact same bytes anyway. This used to
+        # not matter because the script didn't set recordedAt at all, which meant the server
+        # defaulted it fresh on every delivery attempt and completely broke dedup during a
+        # real redelivery event. See the README's P5 section for the full story.
+        recorded_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        payload = json.dumps({
+            "metricType": "temperature",
+            "value": 20.0 + (i % 10),
+            "recordedAt": recorded_at,
+            "idempotencyKey": str(uuid.uuid4()),
+        })
         client.publish(topic, payload, qos=args.qos)
 
     publish_elapsed = time.monotonic() - publish_start

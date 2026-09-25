@@ -11,13 +11,16 @@ import lombok.NoArgsConstructor;
 import lombok.Setter;
 import lombok.ToString;
 
-@Getter 
-@Setter 
-@NoArgsConstructor 
-@ToString 
+// The request body for registering a device. Flat lat/long rather than a nested location
+// object — simpler than mirroring GeoLocation's shape 1:1, at the cost of a few extra
+// lines wherever this gets mapped to a DeviceEntity (see DeviceSvc.createDevice).
+@Getter
+@Setter
+@NoArgsConstructor
+@ToString
 public class DeviceRequest {
 
-    @NotBlank 
+    @NotBlank
     private  String id;
 
     @NotBlank 

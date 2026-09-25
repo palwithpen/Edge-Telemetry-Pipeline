@@ -20,12 +20,17 @@ import jakarta.validation.Valid;
 import org.springframework.web.bind.annotation.GetMapping;
 
 
+// The HTTP-side entry point into ReadingSvc.createReading — the MQTT side goes through
+// ReadingWorkerPool instead, but both end up calling the exact same service method, which
+// is the whole reason business logic lives in the service and not scattered across
+// transports.
+
 @RestController 
 @RequestMapping("/devices/{deviceId}")
 public class ReadingController {
 
     private static final Logger logger = LoggerFactory.getLogger(ReadingController.class);
-
+    
     public ReadingController(ReadingSvc readingSvc){
         this.readingSvc = readingSvc;
     }

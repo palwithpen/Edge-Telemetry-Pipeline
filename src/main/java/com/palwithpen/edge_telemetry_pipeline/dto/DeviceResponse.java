@@ -7,7 +7,10 @@ import com.palwithpen.edge_telemetry_pipeline.model.DeviceType;
 
 import lombok.Getter;
 
-@Getter 
+// Never the entity itself, on purpose — this is what actually goes over the wire. Built
+// from a DeviceEntity via the constructor below, not deserialized from JSON, which is why
+// there's no @Setter or no-arg constructor here (contrast with DeviceRequest).
+@Getter
 public class DeviceResponse {
     private final String id;
     private final String deviceName;

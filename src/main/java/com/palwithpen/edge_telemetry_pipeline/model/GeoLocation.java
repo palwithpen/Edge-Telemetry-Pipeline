@@ -6,10 +6,15 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
-@Embeddable 
-@Getter @Setter @NoArgsConstructor 
-public class GeoLocation {
+// @Embeddable, not its own @Entity — this flattens straight into whichever table embeds it
+// (device, via DeviceEntity.location) rather than living in a separate table needing a join to read.
 
+@Embeddable
+@Getter 
+@Setter 
+@NoArgsConstructor
+public class GeoLocation {
+    
     @Column (name = "latitude")
     private Double latitude;
 

@@ -16,13 +16,12 @@ import com.palwithpen.edge_telemetry_pipeline.model.DeviceEntity;
 import com.palwithpen.edge_telemetry_pipeline.model.GeoLocation;
 import com.palwithpen.edge_telemetry_pipeline.repository.DeviceRepo;
 
+// Device CRUD — the P1 foundation everything else in this project sits on top of. Nothing
+// exciting happens here on purpose; the interesting decisions are more about what ISN'T
+// here (no entities leaking out as responses, no field injection, no unvalidated writes)
+// than what is.
 @Service
 public class DeviceSvc {
-    //  check if the device exists in the db
-    // add the device in the DB
-    // update the device details
-    // delete device
-    // disable the device
 
     private static final Logger logger = LoggerFactory.getLogger(DeviceSvc.class);
 
@@ -56,6 +55,11 @@ public class DeviceSvc {
 
         entity.setLocation(location);
 
+        // The existsById check above is a TOCTOU race waiting to happen: two concurrent
+        // requests for the same id can both pass it (neither sees the other's row yet),
+        // then both try to insert. This catch is the actual safety net — the DB's own
+        // primary-key constraint is what really prevents a duplicate, the check above is
+        // just an optimization to fail fast in the common case.
         DeviceEntity saved ;
         try {
             saved = deviceRepo.saveAndFlush(entity);
@@ -91,6 +95,10 @@ public class DeviceSvc {
 
     }
 
+    // A PATCH, not a PUT — only deviceName/deviceType are updatable, and only the fields
+    // actually present in the request get touched (site/location/id are immutable after
+    // creation). Each field is null-checked independently rather than requiring both, so a
+    // client can update just one without resending the other.
     public DeviceResponse updateDevice(String deviceId, DeviceUpdateRequest request){
         if (request.getDeviceName() == null && request.getDeviceType() == null) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "NO_FIELDS_TO_UPDATE");
